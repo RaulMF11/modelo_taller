@@ -1,0 +1,25 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Entornos Virtuales ---
+.env
+venv/
+env/
+
+# --- IDEs ---
+.vscode/
+.idea/
+
+# --- MACHINE LEARNING (¡AQUÍ ESTÁ LA MAGIA!) ---
+# Ignoramos los modelos pesados para que no se suban a GitHub
+*.pkl
+*.h5
+*.joblib
+model/
+outputs/
+
+# --- Azure ---
+.azureml/
+config.json
