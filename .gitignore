@@ -23,3 +23,5 @@ outputs/
 # --- Azure ---
 .azureml/
 config.json
+
+tests/test_live.py
