@@ -1,24 +1,44 @@
 import os
+import sys
+from pathlib import Path
 from azure.ai.ml import MLClient
 from azure.ai.ml.entities import ManagedOnlineDeployment, CodeConfiguration, OnlineRequestSettings
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 
-# --- CONFIGURACIÓN ---
-SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID") # <--- ¡PON EL TUYO!
-RESOURCE_GROUP = os.getenv("AZURE_RESOURCE_GROUP") # El nombre de tu grupo de recursos
-WORKSPACE_NAME = os.getenv("AZURE_WORKSPACE_NAME") # El nombre de tu recurso de Machine Learning
+# --- 1. CARGAR ENTORNO (FIX) ---
+# Buscamos el .env en la misma carpeta donde está este script
+current_dir = Path(__file__).resolve().parent
+env_path = '.env'
 
-# ENDPOINT_NAME = "diag-exito-d9dd8" # Usamos el endpoint que YA existe para ahorrar
-# DEPLOYMENT_NAME = "blue" # Reemplazaremos el despliegue actual
-# MODEL_NAME = "sistema-experto-completo" # El nombre que registramos hoy
-# ENV_NAME = "catboost-env-py310-final" # El entorno que ya funcionaba
-ENDPOINT_NAME = os.getenv("ENDPOINT_NAME") # Usamos el endpoint que YA existe para ahorrar
-DEPLOYMENT_NAME = os.getenv("DEPLOYMENT_NAME") # Reemplazaremos el despliegue actual
-MODEL_NAME = os.getenv("MODEL_NAME") # El nombre que registramos hoy
-ENV_NAME = os.getenv("ENV_NAME") # El entorno que ya funcionaba
+print(f"🔍 Buscando .env en: {env_path}")
+load_dotenv(dotenv_path=env_path)
+
+# --- 2. CONFIGURACIÓN ---
+# A. Credenciales (Desde el .env)
+SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID")
+RESOURCE_GROUP = os.getenv("AZURE_RESOURCE_GROUP")
+WORKSPACE_NAME = os.getenv("AZURE_WORKSPACE_NAME")
+
+# B. Configuración del Despliegue (FIJOS PARA ASEGURAR QUE NO SEAN NONE)
+# Nota: Pon aquí el nombre exacto de tu endpoint que ya existe en Azure
+ENDPOINT_NAME = "diag-exito-d9dd8" 
+
+# El nombre que le pusimos al deployment (puede ser blue o green)
+DEPLOYMENT_NAME = "blue" 
+
+# El nombre EXACTO que salió en el paso anterior (train.py)
+MODEL_NAME = "sistema-experto-completo" 
+
+# El entorno que creamos la otra vez y que sabemos que funciona
+ENV_NAME = "catboost-env-py310-final" 
 
 def main():
+    # Verificación de seguridad antes de arrancar
+    if not SUBSCRIPTION_ID or not WORKSPACE_NAME:
+        print("❌ ERROR: No se cargaron las credenciales del .env")
+        return
+
     print(f"🚀 Iniciando despliegue en Endpoint: {ENDPOINT_NAME}")
     
     # 1. Conectar a Azure
@@ -30,12 +50,13 @@ def main():
     )
     
     # 2. Configurar el Despliegue
-    # Azure buscará la ULTIMA versión de tu modelo automáticamente
+    # Azure buscará la ÚLTIMA versión (v2, v3...) automáticamente con @latest
     latest_model = f"{MODEL_NAME}@latest"
     latest_env = f"{ENV_NAME}@latest"
     
     print(f"📦 Usando Modelo: {latest_model}")
     print(f"🐍 Usando Entorno: {latest_env}")
+    print(f"📂 Subiendo código desde: ./src")
     
     deployment = ManagedOnlineDeployment(
         name=DEPLOYMENT_NAME,
@@ -43,7 +64,7 @@ def main():
         model=latest_model,
         environment=latest_env,
         code_configuration=CodeConfiguration(
-            code="./src", # Sube TODA la carpeta src (incluye preprocess.py y score.py)
+            code="./src", # Sube la carpeta src con score.py y preprocess.py
             scoring_script="score.py"
         ),
         instance_type="Standard_DS3_v2",
@@ -51,16 +72,17 @@ def main():
         request_settings=OnlineRequestSettings(request_timeout_ms=90000) 
     )
     
-    # 3. Ejecutar (Esto tarda unos 8-10 minutos)
-    print("⏳ Enviando instrucciones a Azure Cloud... (Esto puede tardar, ve por un café ☕)")
+    # 3. Ejecutar
+    print("⏳ Enviando instrucciones a Azure Cloud... (Esto tardará unos 8-10 minutos)")
     ml_client.begin_create_or_update(deployment).result()
     
-    # 4. Asignar Tráfico
+    # 4. Asignar Tráfico (100% al nuevo despliegue)
+    print("🚦 Actualizando tráfico al 100%...")
     endpoint = ml_client.online_endpoints.get(name=ENDPOINT_NAME)
     endpoint.traffic = {DEPLOYMENT_NAME: 100}
     ml_client.begin_create_or_update(endpoint).result()
     
-    print(f"✅ ¡DESPLIEGUE COMPLETADO! Tu API está lista.")
+    print(f"✅ ¡DESPLIEGUE COMPLETADO! Tu API está lista y actualizada.")
 
 if __name__ == "__main__":
     main()

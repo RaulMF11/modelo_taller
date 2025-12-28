@@ -25,3 +25,9 @@ outputs/
 config.json
 
 tests/test_live.py
+
+crear_catalogo.py
+generar_datos.py
+get_keys.py
+subir_datos.py
+generar_datos_v2.py
