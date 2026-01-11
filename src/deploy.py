@@ -6,40 +6,33 @@ from azure.ai.ml.entities import ManagedOnlineDeployment, CodeConfiguration, Onl
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 
-# --- 1. CARGAR ENTORNO (FIX) ---
-# Buscamos el .env en la misma carpeta donde está este script
+# --- 1. CARGAR ENTORNO ---
+# Ajuste: Buscamos el .env en la carpeta RAÍZ (padre de src), igual que en train.py
 current_dir = Path(__file__).resolve().parent
-env_path = '.env'
+env_path = current_dir.parent / '.env'
 
 print(f"🔍 Buscando .env en: {env_path}")
 load_dotenv(dotenv_path=env_path)
 
 # --- 2. CONFIGURACIÓN ---
-# A. Credenciales (Desde el .env)
+# A. Credenciales
 SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID")
 RESOURCE_GROUP = os.getenv("AZURE_RESOURCE_GROUP")
 WORKSPACE_NAME = os.getenv("AZURE_WORKSPACE_NAME")
 
-# B. Configuración del Despliegue (FIJOS PARA ASEGURAR QUE NO SEAN NONE)
-# Nota: Pon aquí el nombre exacto de tu endpoint que ya existe en Azure
-ENDPOINT_NAME = "diag-exito-d9dd8" 
-
-# El nombre que le pusimos al deployment (puede ser blue o green)
-DEPLOYMENT_NAME = "blue" 
-
-# El nombre EXACTO que salió en el paso anterior (train.py)
-MODEL_NAME = "sistema-experto-completo" 
-
-# El entorno que creamos la otra vez y que sabemos que funciona
-ENV_NAME = "catboost-env-py310-final" 
+# B. Configuración del Despliegue
+ENDPOINT_NAME = "diag-exito-d9dd8"  # Tu endpoint existente
+DEPLOYMENT_NAME = "blue"            # Estrategia Blue/Green
+MODEL_NAME = "sistema-experto-completo" # ¡IMPORTANTE! Debe coincidir con train.py
+ENV_NAME = "catboost-env-py310-final"   # Tu entorno funcional
 
 def main():
-    # Verificación de seguridad antes de arrancar
+    # Verificación de seguridad
     if not SUBSCRIPTION_ID or not WORKSPACE_NAME:
-        print("❌ ERROR: No se cargaron las credenciales del .env")
+        print("❌ ERROR: No se cargaron las credenciales. Verifica la ruta del .env")
         return
 
-    print(f"🚀 Iniciando despliegue en Endpoint: {ENDPOINT_NAME}")
+    print(f"🚀 Iniciando actualización del Endpoint: {ENDPOINT_NAME}")
     
     # 1. Conectar a Azure
     ml_client = MLClient(
@@ -50,13 +43,12 @@ def main():
     )
     
     # 2. Configurar el Despliegue
-    # Azure buscará la ÚLTIMA versión (v2, v3...) automáticamente con @latest
+    # Usamos @latest para que Azure tome automáticamente el modelo que acabas de entrenar
     latest_model = f"{MODEL_NAME}@latest"
     latest_env = f"{ENV_NAME}@latest"
     
-    print(f"📦 Usando Modelo: {latest_model}")
-    print(f"🐍 Usando Entorno: {latest_env}")
-    print(f"📂 Subiendo código desde: ./src")
+    print(f"📦 Modelo seleccionado: {latest_model}")
+    print(f"📂 Subiendo código (src/score.py + src/preprocess.py)...")
     
     deployment = ManagedOnlineDeployment(
         name=DEPLOYMENT_NAME,
@@ -64,25 +56,26 @@ def main():
         model=latest_model,
         environment=latest_env,
         code_configuration=CodeConfiguration(
-            code="./src", # Sube la carpeta src con score.py y preprocess.py
+            code="./src", # Importante: Sube toda la carpeta src para que score.py encuentre a preprocess.py
             scoring_script="score.py"
         ),
         instance_type="Standard_DS3_v2",
         instance_count=1,
+        # Aumentamos el timeout por si CatBoost tarda en cargar en memoria
         request_settings=OnlineRequestSettings(request_timeout_ms=90000) 
     )
     
-    # 3. Ejecutar
-    print("⏳ Enviando instrucciones a Azure Cloud... (Esto tardará unos 8-10 minutos)")
+    # 3. Ejecutar (Create or Update)
+    print("⏳ Enviando despliegue a Azure Cloud... (Esto tardará unos 8-10 minutos)")
     ml_client.begin_create_or_update(deployment).result()
     
-    # 4. Asignar Tráfico (100% al nuevo despliegue)
-    print("🚦 Actualizando tráfico al 100%...")
+    # 4. Asignar Tráfico
+    print("🚦 Redirigiendo el 100% del tráfico a la nueva versión...")
     endpoint = ml_client.online_endpoints.get(name=ENDPOINT_NAME)
     endpoint.traffic = {DEPLOYMENT_NAME: 100}
     ml_client.begin_create_or_update(endpoint).result()
     
-    print(f"✅ ¡DESPLIEGUE COMPLETADO! Tu API está lista y actualizada.")
+    print(f"✅ ¡DESPLIEGUE COMPLETADO! Tu API está actualizada con la lógica de Tesis (Sin Sensores).")
 
 if __name__ == "__main__":
     main()

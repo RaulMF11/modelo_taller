@@ -1,9 +1,9 @@
 import os
-import urllib # <--- NUEVO
+import urllib
 import pandas as pd
 import joblib
 from pathlib import Path
-from sqlalchemy import create_engine # <--- NUEVO
+from sqlalchemy import create_engine
 from catboost import CatBoostClassifier
 from azure.ai.ml import MLClient
 from azure.ai.ml.entities import Model
@@ -12,48 +12,63 @@ from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 from preprocess import calcular_dias_mantenimiento
 
-# --- 1. CONFIGURACIÓN ROBUSTA DE ENTORNO ---
+# --- 1. CONFIGURACIÓN DE ENTORNO ---
 current_dir = Path(__file__).resolve().parent
 env_path = current_dir.parent / '.env'
 
 print(f"🔍 Buscando .env en: {env_path}")
 load_dotenv(dotenv_path=env_path)
 
-# --- DEBUG: VERIFICAR VARIABLES ---
-server = os.getenv("SQL_SERVER")
-database = os.getenv("SQL_DB")
-
-if not server or not database:
-    print("❌ ERROR CRÍTICO: No se leyeron las variables del .env")
-    exit()
-else:
-    print(f"✅ Variables cargadas. Servidor: {server} | BD: {database}")
-    
-# Azure ML Details
+# Variables de Azure y SQL
 SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID") 
 RESOURCE_GROUP = os.getenv("AZURE_RESOURCE_GROUP") 
 WORKSPACE_NAME = os.getenv("AZURE_WORKSPACE_NAME") 
 
-# Azure SQL Details
 SQL_SERVER = os.getenv("SQL_SERVER")
 SQL_DB = os.getenv("SQL_DB")
 SQL_USER = os.getenv("SQL_USER")
 SQL_PWD = os.getenv("SQL_PWD")
 
 def entrenar_modelo_cascada(df, X_cols, y_col, nombre_modelo, cat_features):
+    """
+    Función genérica para entrenar un eslabón de la cadena.
+    """
     print(f"   ⚙️ Entrenando sub-modelo: {nombre_modelo} para predecir '{y_col}'...")
     
-    X = df[X_cols]
-    y = df[y_col]
+    # 1. Filtrar datos nulos en el objetivo
+    df_train = df.dropna(subset=[y_col])
     
+    # 2. Copiar X para evitar advertencias de pandas
+    X = df_train[X_cols].copy()
+    y = df_train[y_col]
+    
+    # --- CORRECCIÓN CRÍTICA: FORZAR TIPOS A STRING ---
+    # Esto soluciona el error "Cannot convert to float" en Postman.
+    # Aseguramos que CatBoost sepa que estas columnas SON TEXTO/CATEGORÍAS.
+    if cat_features:
+        for col in cat_features:
+            if col in X.columns:
+                # Rellenamos nulos con "Desconocido" y convertimos a string
+                X[col] = X[col].fillna("Desconocido").astype(str)
+    # -------------------------------------------------
+
+    # Detección de columna de texto libre (NLP)
+    text_features = []
+    if 'descripcion_sintomas' in X_cols:
+        text_features = ['descripcion_sintomas']
+        # Aseguramos que el síntoma también sea string
+        X['descripcion_sintomas'] = X['descripcion_sintomas'].fillna("").astype(str)
+
+    # Configurar CatBoost
     model = CatBoostClassifier(
-        iterations=100,
+        iterations=150,
         learning_rate=0.1,
         depth=6,
         loss_function='MultiClass',
         verbose=50,
         cat_features=cat_features,
-        text_features=['descripcion_sintomas'] if 'descripcion_sintomas' in X_cols else None
+        text_features=text_features,
+        allow_writing_files=False
     )
     
     model.fit(X, y)
@@ -64,12 +79,13 @@ def entrenar_modelo_cascada(df, X_cols, y_col, nombre_modelo, cat_features):
     return model
 
 def main():
-    print("🚀 Iniciando Protocolo de Entrenamiento en Cascada (CPMA)...")
+    print("🚀 Iniciando Protocolo de Entrenamiento desde Azure SQL...")
 
-    # --- 2. CARGA DE DATOS (FIX SQLAlchemy) ---
+    # --- 2. CONEXIÓN A BASE DE DATOS ---
+    if not SQL_SERVER or not SQL_DB:
+        raise ValueError("❌ Faltan variables de entorno SQL_SERVER o SQL_DB")
+
     print("🔌 Conectando a Azure SQL...")
-    
-    # Construimos la conexión segura que entiende fechas complejas
     params = urllib.parse.quote_plus(
         f"DRIVER={{ODBC Driver 17 for SQL Server}};"
         f"SERVER={SQL_SERVER};"
@@ -78,91 +94,110 @@ def main():
         f"PWD={SQL_PWD}"
     )
     conn_str = f"mssql+pyodbc:///?odbc_connect={params}"
-    engine = create_engine(conn_str) # Creamos el motor
+    engine = create_engine(conn_str)
     
-    query = "SELECT * FROM Diagnosticos WHERE es_correcto = 1"
+    # Traemos todo lo que tenga una 'falla_real' registrada
+    query = "SELECT * FROM Diagnosticos WHERE falla_real IS NOT NULL"
     
-    # Leemos usando el engine (SQLAlchemy) en lugar de la conexión cruda
-    df = pd.read_sql(query, engine) 
-    
+    try:
+        df = pd.read_sql(query, engine)
+        print(f"📊 Registros cargados desde BD: {len(df)}")
+    except Exception as e:
+        print(f"❌ Error conectando a SQL: {e}")
+        return
+
+    if len(df) == 0:
+        print("⚠️ ALERTA: La base de datos devolvió 0 registros con falla_real.")
+        return
+
     # --- 3. PREPROCESAMIENTO ---
-    print(f"🧹 Limpiando datos ({len(df)} registros encontrados)...")
+    print("🧹 Preprocesando datos...")
+    
+    # Calcular días desde último mantenimiento
     df = calcular_dias_mantenimiento(df)
     
-    cols_sensores = [
-        'sensor_rpm', 'sensor_presion_aceite', 'sensor_temperatura_motor', 
-        'sensor_voltaje_bateria', 'sensor_velocidad', 'sensor_nivel_combustible'
-    ]
-    df[cols_sensores] = df[cols_sensores].fillna(-1)
+    # Limpieza básica de nulos en columnas numéricas clave
+    df['kilometraje'] = df['kilometraje'].fillna(0).astype(int)
+    df['anio'] = df['anio'].fillna(2015).astype(int)
 
-    # Creamos carpeta para guardar los 4 cerebros
+    # Creamos carpeta local para guardar modelos temporales
     os.makedirs("model", exist_ok=True)
 
     # ==============================================================================
-    # ⛓️ ARQUITECTURA EN CASCADA (CHAINED MODELS)
+    # ⛓️ ARQUITECTURA EN CASCADA (SIN SENSORES)
     # ==============================================================================
     
+    # DEFINICIÓN DE FEATURES BASE
     base_features = [
-        'marca', 'modelo', 'anio', 'kilometraje', 'descripcion_sintomas', 
+        'marca', 
+        'modelo', 
+        'anio', 
+        'kilometraje', 
+        'descripcion_sintomas', 
         'dias_ultimo_mant'
-    ] + cols_sensores
+    ]
 
-    # FASE 1: FALLA
-    print("\n🧠 [Nivel 1] Entrenando Diagnosticador de Falla...")
+    # --- FASE 1: FALLA (SISTEMA) ---
+    print("\n🧠 [Nivel 1] Entrenando: Falla del Sistema...")
     entrenar_modelo_cascada(
         df, 
         X_cols=base_features, 
         y_col='falla_real', 
         nombre_modelo='chain_1_falla',
-        cat_features=['marca', 'modelo', 'descripcion_sintomas']
+        cat_features=['marca', 'modelo']
     )
 
-    # FASE 1.5: SUBFALLA
-    print("\n🧠 [Nivel 1.5] Entrenando Diagnosticador de Subfalla...")
+    # --- FASE 2: SUBFALLA (COMPONENTE) ---
+    print("\n🧠 [Nivel 2] Entrenando: Componente Específico...")
     features_subfalla = base_features + ['falla_real'] 
     entrenar_modelo_cascada(
         df, 
         X_cols=features_subfalla, 
         y_col='subfalla_real', 
         nombre_modelo='chain_2_subfalla',
-        cat_features=['marca', 'modelo', 'descripcion_sintomas', 'falla_real'] 
+        cat_features=['marca', 'modelo', 'falla_real'] 
     )
 
-    # FASE 2: SOLUCIÓN
-    print("\n👨‍🔧 [Nivel 2] Entrenando Experto de Soluciones...")
+    # --- FASE 3: SOLUCIÓN ---
+    print("\n👨‍🔧 [Nivel 3] Entrenando: Generador de Soluciones...")
     features_solucion = base_features + ['falla_real', 'subfalla_real']
     entrenar_modelo_cascada(
         df,
         X_cols=features_solucion,
         y_col='solucion_real',
         nombre_modelo='chain_3_solucion',
-        cat_features=['marca', 'modelo', 'descripcion_sintomas', 'falla_real', 'subfalla_real']
+        cat_features=['marca', 'modelo', 'falla_real', 'subfalla_real']
     )
 
-    # FASE 2.5: GRAVEDAD
-    print("\n⚠️ [Nivel 2.5] Entrenando Analista de Gravedad...")
+    # --- FASE 4: GRAVEDAD ---
+    print("\n⚠️ [Nivel 4] Entrenando: Calculadora de Riesgo...")
+    # OJO: Aquí agregamos solucion_real como feature categórico, que era lo que fallaba
     features_gravedad = features_solucion + ['solucion_real']
     entrenar_modelo_cascada(
         df,
         X_cols=features_gravedad,
         y_col='gravedad_real',
         nombre_modelo='chain_4_gravedad',
-        cat_features=['marca', 'modelo', 'descripcion_sintomas', 'falla_real', 'subfalla_real', 'solucion_real']
+        cat_features=['marca', 'modelo', 'falla_real', 'subfalla_real', 'solucion_real']
     )
 
     # --- 4. REGISTRO EN AZURE ---
-    print("\n☁️ Subiendo el 'Cerebro Completo' a Azure...")
-    ml_client = MLClient(DefaultAzureCredential(), SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME)
+    print("\n☁️ Subiendo modelos a Azure Machine Learning...")
+    try:
+        ml_client = MLClient(DefaultAzureCredential(), SUBSCRIPTION_ID, RESOURCE_GROUP, WORKSPACE_NAME)
 
-    azure_model = Model(
-        path="model", 
-        name="sistema-experto-completo", 
-        description="Sistema Cascada: Falla -> Subfalla -> Solucion -> Gravedad",
-        type=AssetTypes.CUSTOM_MODEL
-    )
+        azure_model = Model(
+            path="model", 
+            name="sistema-experto-completo", 
+            description="Modelo Cascada BD: Síntomas + Historial -> Diagnóstico",
+            type=AssetTypes.CUSTOM_MODEL
+        )
 
-    registered_model = ml_client.models.create_or_update(azure_model)
-    print(f"✅ ¡ÉXITO! Modelo registrado: {registered_model.name} (v{registered_model.version})")
+        registered_model = ml_client.models.create_or_update(azure_model)
+        print(f"✅ ¡ÉXITO! Modelo registrado: {registered_model.name} (v{registered_model.version})")
+        
+    except Exception as e:
+        print(f"⚠️ Error subiendo a Azure: {e}")
 
 if __name__ == "__main__":
     main()

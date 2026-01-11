@@ -5,94 +5,109 @@ import pandas as pd
 import logging
 from preprocess import calcular_dias_mantenimiento
 
-# Cargamos los 4 modelos en variables globales
+# Variables globales para los modelos
 def init():
     global m_falla, m_subfalla, m_solucion, m_gravedad
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
     
-    base_path = os.getenv("AZUREML_MODEL_DIR") # Carpeta en la nube
-    # Si pruebas local, descomenta esto: base_path = "model" 
+    # Azure monta los archivos en esta variable de entorno
+    base_path = os.getenv("AZUREML_MODEL_DIR")
     
-    # Cargamos la cadena completa
+    # Lógica de carga robusta
     try:
+        # Intento 1: Estructura estándar (carpeta model dentro del deploy)
         m_falla = joblib.load(os.path.join(base_path, "model", "chain_1_falla.pkl"))
         m_subfalla = joblib.load(os.path.join(base_path, "model", "chain_2_subfalla.pkl"))
         m_solucion = joblib.load(os.path.join(base_path, "model", "chain_3_solucion.pkl"))
         m_gravedad = joblib.load(os.path.join(base_path, "model", "chain_4_gravedad.pkl"))
-        logger.info("✅ Cadena de 4 modelos cargada correctamente.")
-    except Exception as e:
-        logger.error(f"🔥 Error cargando modelos: {e}")
-        # Intento de ruta alternativa (a veces Azure duplica la carpeta model/model)
+        logger.info("✅ Cadena de 4 modelos cargada desde /model.")
+        
+    except Exception as e1:
+        logger.warning(f"⚠️ No se encontró en /model, intentando raíz: {e1}")
         try:
-            path_fix = os.path.join(base_path, "chain_1_falla.pkl")
-            if os.path.exists(path_fix):
-                m_falla = joblib.load(os.path.join(base_path, "chain_1_falla.pkl"))
-                m_subfalla = joblib.load(os.path.join(base_path, "chain_2_subfalla.pkl"))
-                m_solucion = joblib.load(os.path.join(base_path, "chain_3_solucion.pkl"))
-                m_gravedad = joblib.load(os.path.join(base_path, "chain_4_gravedad.pkl"))
-                logger.info("✅ Cadena cargada (Ruta alternativa).")
-            else:
-                raise e
-        except:
-            raise e
+            # Intento 2: Si Azure descomprimió los archivos en la raíz
+            m_falla = joblib.load(os.path.join(base_path, "chain_1_falla.pkl"))
+            m_subfalla = joblib.load(os.path.join(base_path, "chain_2_subfalla.pkl"))
+            m_solucion = joblib.load(os.path.join(base_path, "chain_3_solucion.pkl"))
+            m_gravedad = joblib.load(os.path.join(base_path, "chain_4_gravedad.pkl"))
+            logger.info("✅ Cadena cargada desde raíz.")
+        except Exception as e2:
+            logger.error(f"🔥 ERROR FATAL: No se pudieron cargar los modelos. {e2}")
+            raise e2
 
 def run(raw_data):
     try:
+        # 1. Convertir JSON a DataFrame
         data_dict = json.loads(raw_data)
-        df = pd.DataFrame([data_dict])
         
-        # 1. Preprocesamiento Base
+        # Soporte para enviar un solo objeto o una lista "data": []
+        if 'data' in data_dict:
+            df = pd.DataFrame(data_dict['data'])
+        else:
+            df = pd.DataFrame([data_dict])
+        
+        # 2. Preprocesamiento (Cálculo de días)
         df = calcular_dias_mantenimiento(df)
-        cols_sensores = [
-            'sensor_rpm', 'sensor_presion_aceite', 'sensor_temperatura_motor', 
-            'sensor_voltaje_bateria', 'sensor_velocidad', 'sensor_nivel_combustible'
-        ]
-        for col in cols_sensores:
-            df[col] = df.get(col, pd.Series([-1] * len(df))).fillna(-1)
 
-        # Definimos features base (orden correcto)
+        # 3. Features Base (SIN SENSORES)
         base_features = [
-            'marca', 'modelo', 'anio', 'kilometraje', 'descripcion_sintomas', 
+            'marca', 
+            'modelo', 
+            'anio', 
+            'kilometraje', 
+            'descripcion_sintomas', 
             'dias_ultimo_mant'
-        ] + cols_sensores
+        ]
+        
+        # Asegurar tipos de datos de entrada
+        df['kilometraje'] = df['kilometraje'].astype(int)
+        df['anio'] = df['anio'].astype(int)
+        # Asegurar que los síntomas sean string (evita error si llega nulo)
+        df['descripcion_sintomas'] = df['descripcion_sintomas'].fillna("").astype(str)
         
         # -------------------------------------------------------
-        # ⛓️ EJECUCIÓN EN CASCADA
+        # ⛓️ EJECUCIÓN EN CASCADA (Forzando Texto)
         # -------------------------------------------------------
         
-        # PASO 1: Predecir Falla
+        # PASO 1: Predecir Falla del Sistema
         pred_falla = m_falla.predict(df[base_features])[0][0]
         
         # PASO 2: Predecir Subfalla
-        # Inyectamos la predicción anterior como si fuera un dato real
-        df['falla_real'] = pred_falla 
+        # IMPORTANTE: str() convierte la predicción a texto explícito
+        df['falla_real'] = str(pred_falla) 
         features_step2 = base_features + ['falla_real']
         pred_subfalla = m_subfalla.predict(df[features_step2])[0][0]
         
-        # PASO 3: Predecir Solución (Experto)
-        # Inyectamos falla y subfalla
-        df['subfalla_real'] = pred_subfalla
+        # PASO 3: Predecir Solución Técnica
+        df['subfalla_real'] = str(pred_subfalla)
         features_step3 = features_step2 + ['subfalla_real']
         pred_solucion = m_solucion.predict(df[features_step3])[0][0]
         
         # PASO 4: Predecir Gravedad
-        df['solucion_real'] = pred_solucion
+        # AQUÍ OCURRÍA EL ERROR ANTES: Ahora forzamos a que sea texto
+        df['solucion_real'] = str(pred_solucion)
         features_step4 = features_step3 + ['solucion_real']
         pred_gravedad = m_gravedad.predict(df[features_step4])[0][0]
         
-        # Confianza (del primer modelo principal)
-        confianza = max(m_falla.predict_proba(df[base_features])[0])
+        # Calcular confianza
+        probs = m_falla.predict_proba(df[base_features])[0]
+        confianza = max(probs)
 
-        # RETORNO FINAL
+        # 4. Respuesta
         return {
-            "falla_predicha": pred_falla,
-            "subfalla_predicha": pred_subfalla,
-            "solucion_predicha": pred_solucion,
-            "gravedad_predicha": pred_gravedad,
-            "confianza": float(confianza),
-            "mensaje": "Diagnóstico en Cascada Completado"
+            "diagnostico_ia": {
+                "sistema_afectado": pred_falla,
+                "detalle_tecnico": pred_subfalla,
+                "accion_recomendada": pred_solucion,
+                "nivel_riesgo": pred_gravedad,
+                "probabilidad_acierto": float(round(confianza, 2))
+            },
+            "meta": {
+                "modelo": "v3_cascada_texto_forzado",
+                "status": "success"
+            }
         }
 
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": f"Error en inferencia: {str(e)}"}
